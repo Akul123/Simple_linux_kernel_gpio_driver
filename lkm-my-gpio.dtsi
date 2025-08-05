@@ -1,0 +1,17 @@
+/ {
+    my_gpio_devs{
+        compatible = "org,my-gpio-sysfs";
+        gpio-button-1 {
+			label = "button1";
+            direction = "in";
+			my-gpios = <&gpio 25 GPIO_ACTIVE_HIGH>;
+			linux,code = <108>; /*KEY_DOWN*/
+		};
+        gpio-led-1{
+            label = "led1";
+            default-state = "off";
+            direction = "out";
+            my-gpios = <&gpio 24 GPIO_ACTIVE_HIGH>;
+        };
+    };
+};

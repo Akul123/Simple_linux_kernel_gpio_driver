@@ -1,0 +1,6 @@
+config BR2_PACKAGE_LKM_MY_GPIOS
+        bool "lkm my gpios device driver"
+        depends on BR2_LINUX_KERNEL
+        help
+                Linux kernel platform gpio device driver with sysfs functions.
+                1 led and 1 button.

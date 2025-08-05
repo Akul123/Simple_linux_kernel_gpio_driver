@@ -1,0 +1,290 @@
+#include "lkm_my_gpios.h"
+#include <linux/gpio/consumer.h>
+#include <linux/input.h>
+#include <linux/init.h>
+#include <linux/irq.h>
+#include <linux/interrupt.h>
+
+struct of_device_id gpio_device_match []={
+	{
+		.compatible="org,my-gpio-sysfs",
+	},
+	{} // null terminated
+};
+
+struct gpio_drv_private_data gpio_drv_data;
+
+ssize_t direction_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	int dir;
+	char *direction;
+	struct gpio_dev_private_data *dev_priv_data = dev_get_drvdata(dev);
+
+	dir = gpiod_get_direction(dev_priv_data->desc);
+	if(dir < 0)
+		return dir;
+
+	direction = (dir == 0) ? "out" : "in";
+
+	return sprintf(buf,"%s", direction);
+}
+
+ssize_t direction_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	int ret;
+	struct gpio_dev_private_data *dev_priv_data = dev_get_drvdata(dev);
+
+	if(sysfs_streq(buf, "in"))
+		ret = gpiod_direction_input(dev_priv_data->desc);
+	else if(sysfs_streq(buf, "out"))
+		ret = gpiod_direction_output(dev_priv_data->desc, 0);
+	else
+		ret = -EINVAL;
+
+	return ret ? ret : count;
+}
+
+ssize_t value_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	int value;
+	struct gpio_dev_private_data *dev_priv_data = dev_get_drvdata(dev);
+
+	value = gpiod_get_value(dev_priv_data->desc);
+
+	return sprintf(buf, "%d\n", value);
+}
+
+ssize_t value_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	int ret;
+	long value;
+
+	struct gpio_dev_private_data *dev_priv_data = dev_get_drvdata(dev);
+
+	if(IS_ERR(dev_priv_data->desc)){
+		dev_info(dev, "Error device description\n");
+		return 1;
+	}
+
+	ret = kstrtol(buf, 0, &value);
+	if(ret){
+		dev_info(dev, "Error ret %d\n", ret);
+		return ret;
+	}
+
+	dev_info(dev, "setting device value %ld\n", value);
+	gpiod_set_value(dev_priv_data->desc, value);
+
+	return count;
+}
+
+ssize_t label_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct gpio_dev_private_data *dev_priv_data = dev_get_drvdata(dev);
+
+	return sprintf(buf, "%s\n", dev_priv_data->label);
+}
+
+static DEVICE_ATTR_RW(direction);
+static DEVICE_ATTR_RW(value);
+static DEVICE_ATTR_RO(label);
+
+static struct attribute *gpio_attrs[] = {
+	&dev_attr_direction.attr,
+	&dev_attr_value.attr,
+	&dev_attr_label.attr,
+	NULL
+};
+
+static struct attribute_group gpio_attr_group = {
+	.attrs = gpio_attrs,
+};
+
+static const struct attribute_group *gpio_attr_groups[] = {
+	&gpio_attr_group,
+	NULL
+};
+
+static irqreturn_t gpio_irq_handler(int irq, void *dev_id)
+{
+	int i;
+	struct gpio_dev_private_data *dev_data = (struct gpio_dev_private_data*)dev_id;
+	struct gpio_desc *desc = dev_data->desc;
+    int current_state;
+	int dir;
+
+	if(IS_ERR(dev_data->desc)){
+		printk("Error device description\n");
+		return -1;
+	}
+
+	current_state = gpiod_get_value(desc);
+
+	if ( current_state ){
+		for(i = 0; i < gpio_drv_data.total_devices; ++i){
+			/* set all OUTPUTS ON*/
+			struct gpio_dev_private_data* dev = dev_get_drvdata(gpio_drv_data.dev[i]);
+
+			dir = gpiod_get_direction(dev->desc);
+			if(dir < 0)
+				return dir;
+
+			if (dir == 0 ) // dir=0 means output
+				gpiod_set_value(dev->desc, 1);
+		}
+	} else {
+		for(i = 0; i < gpio_drv_data.total_devices; ++i){
+			/* set all OUTPUTS OFF*/
+			struct gpio_dev_private_data* dev = dev_get_drvdata(gpio_drv_data.dev[i]);
+
+			dir = gpiod_get_direction(dev->desc);
+			if(dir < 0)
+				return dir;
+
+			if (dir == 0 ) // dir=0 means output
+				gpiod_set_value(dev->desc, 0);
+		}
+	}
+
+	return IRQ_HANDLED;
+}
+
+int gpio_sysfs_probe(struct platform_device *pdev)
+{
+	int ret;
+	struct device *dev = &pdev->dev;
+	struct device *dev_sysfs;
+	/* parent device node */
+	struct device_node *parent = pdev->dev.of_node;
+	struct device_node *child = NULL;
+	const char *name;
+	const char *direction;
+	int i = 0;
+	struct gpio_dev_private_data *dev_data;
+
+	gpio_drv_data.total_devices = of_get_child_count(parent);
+	if(!gpio_drv_data.total_devices){
+		dev_err(dev, "No devices found\n");
+		return -EINVAL;
+	}
+	dev_info(dev, "Total devices count %d\n", gpio_drv_data.total_devices);
+
+	gpio_drv_data.dev = devm_kzalloc(dev, sizeof(struct device)*gpio_drv_data.total_devices, GFP_KERNEL);
+
+	for_each_available_child_of_node(parent, child){
+		dev_data = devm_kzalloc(dev, sizeof(dev_data), GFP_KERNEL);
+		if(!dev_data){
+			dev_err(dev, "Can not allocate memory!\n");
+			return -ENOMEM;
+		}
+		/* get label info from device tree */
+		if(of_property_read_string(child, "label", &name)){
+			dev_warn(dev, "Missing label information!\n");
+			snprintf(dev_data->label, sizeof(dev_data->label), "unknowngpio%d", i);
+		}
+		else {
+			strcpy(dev_data->label, name);
+			dev_info(dev, "GPIO label = %s \n", dev_data->label);
+		}
+
+		dev_data->desc = devm_fwnode_gpiod_get(dev, &child->fwnode, "my", GPIOD_ASIS, dev_data->label);
+		if(IS_ERR(dev_data->desc)){
+			ret=PTR_ERR(dev_data->desc);
+			if(ret == -ENOENT)
+				dev_err(dev, "No GPIO has been assigned to the requested function and/or index\n");
+			return ret;
+		}
+		/* get direction info from device tree */
+		if(of_property_read_string(child, "direction", &direction)){
+			dev_warn(dev, "Missing direction information!\n");
+			//snprintf(dev_data->label, sizeof(dev_data->label), "unknowngpio%d", i);
+		}
+		else {
+			if (!strcmp(direction, "out")) {
+				/* set gpio direction to OUTPUT */
+				dev_info(dev, "setting direction to %s", direction);
+				ret = gpiod_direction_output(dev_data->desc, 0);
+				if(ret)
+					dev_err(dev, "gpio direction set to output failed\n");
+			} else if (!strcmp(direction, "in")) {
+				/* set gpio direction to INPUT */
+				dev_info(dev, "setting direction to %s", direction);
+				ret = gpiod_direction_input(dev_data->desc);
+				if(ret)
+					dev_err(dev, "gpio direction set to input failed\n");
+				/* request irg id for button */
+				dev_data->button_irq = gpiod_to_irq(dev_data->desc);
+				dev_info(dev, "%s irq id %d \n", dev_data->label, dev_data->button_irq);
+				if (dev_data->button_irq < 0) {
+					dev_err(dev, "failed to get ID IRQ\n");
+					return PTR_ERR(dev_sysfs);
+				}
+
+				/* create interrupt and request handler for IRQ*/
+				ret = devm_request_irq(dev, dev_data->button_irq, gpio_irq_handler,
+										IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
+										dev_data->label, dev_data);
+				if (ret < 0) {
+					dev_err(dev, "failed to request handler for ID IRQ\n");
+					return ret;
+				}
+			}
+		}
+
+		/* create devices under /sys/class/my_gpios */
+		gpio_drv_data.dev[i] = device_create_with_groups(gpio_drv_data.class_gpio, dev, 0, dev_data, gpio_attr_groups, dev_data->label);
+		if(IS_ERR(gpio_drv_data.dev[i]))
+			return PTR_ERR(dev_sysfs);
+		++i;
+	}
+	return 0;
+}
+
+int gpio_sysfs_remove(struct platform_device *pdev)
+{
+	int i;
+	struct device *dev = &pdev->dev;
+
+	dev_info(dev,"Remove called\n");
+
+	for(i=0; i<gpio_drv_data.total_devices; ++i){
+		device_unregister(gpio_drv_data.dev[i]);
+	}
+	return 0;
+}
+
+struct platform_driver gpio_sysfs_platform_driver = {
+	.probe=gpio_sysfs_probe,
+	.remove=gpio_sysfs_remove,
+	.driver={
+		.name="my-gpio-sysfs",
+		.of_match_table=of_match_ptr(gpio_device_match),
+	}
+};
+
+static int __init gpio_sysfs_driver_init(void)
+{
+	gpio_drv_data.class_gpio = class_create("my_gpios");//class_create(THIS_MODULE, "my_gpios");
+	if(IS_ERR(gpio_drv_data.class_gpio)){
+		pr_err("Error in creating class\n");
+		return PTR_ERR(gpio_drv_data.class_gpio);
+	}
+
+	platform_driver_register(&gpio_sysfs_platform_driver);
+	pr_info("Module loaded successful\n");
+
+	return 0;
+};
+
+//function which is called when module is removed from a kernel
+static void __exit gpio_sysfs_driver_exit(void){
+	/* 1. unregister platform device */
+    platform_driver_unregister(&gpio_sysfs_platform_driver);
+
+	/* 2. Class destroy */
+	class_destroy(gpio_drv_data.class_gpio);
+
+};
+
+module_init(gpio_sysfs_driver_init);
+module_exit(gpio_sysfs_driver_exit);
